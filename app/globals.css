@@ -79,19 +79,35 @@ button:disabled { cursor: not-allowed; opacity: .4; }
 .zoom-control button { width: 28px; height: 27px; border: 0; background: transparent; color: var(--ink); cursor: pointer; font-size: 16px; }
 .zoom-control button:hover { background: #efefeb; }
 .zoom-control span { min-width: 47px; text-align: center; color: #56605d; font-size: 10px; }
-.pages-scroll { flex: 1; overflow: auto; padding: 36px max(28px, 5vw) 70px; }
+.pages-scroll { flex: 1; overflow: auto; padding: 36px max(28px, 5vw) 70px max(82px, 5vw); }
 .page-card { position: relative; width: max-content; margin: 0 auto 40px; }
-.page-number { position: absolute; right: calc(100% + 12px); top: 0; width: 24px; height: 24px; display: grid; place-items: center; border-radius: 6px; color: #707975; background: #efeee9; font-size: 10px; font-weight: 700; }
-.page-surface { position: relative; background: white; box-shadow: 0 9px 26px rgba(34, 40, 38, .16), 0 0 0 1px rgba(32, 37, 35, .08); }
+.page-controls { position: absolute; right: calc(100% + 10px); top: 0; display: grid; justify-items: end; gap: 7px; z-index: 4; }
+.page-number { width: 24px; height: 24px; display: grid; place-items: center; border-radius: 6px; color: #707975; background: #efeee9; font-size: 10px; font-weight: 700; }
+.page-inclusion-button { min-width: 62px; display: flex; align-items: center; justify-content: center; gap: 4px; border: 1px solid #c7cac5; border-radius: 7px; background: #f8f7f3; color: #53605c; padding: 5px 7px; font-size: 9px; font-weight: 700; cursor: pointer; box-shadow: 0 2px 6px rgba(25, 32, 30, .08); }
+.page-inclusion-button span { font-size: 14px; line-height: 8px; }
+.page-inclusion-button:hover { border-color: #8f9792; color: var(--ink); background: #fff; }
+.page-inclusion-button[aria-pressed='true'] { color: #8a3732; border-color: #d7aaa5; background: #fae8e4; }
+.page-card.is-excluded .page-surface { opacity: .38; filter: grayscale(.75); }
+.page-card.is-excluded .page-number { color: #8a3732; background: #fae8e4; }
+.page-surface { position: relative; background: white; box-shadow: 0 9px 26px rgba(34, 40, 38, .16), 0 0 0 1px rgba(32, 37, 35, .08); transition: opacity .18s, filter .18s; }
 .page-surface canvas { position: absolute; inset: 0; display: block; }
 .page-surface.is-rendering { min-height: 220px; }
 .page-loading { position: absolute; inset: 0; display: grid; place-items: center; z-index: 3; background: #fafafa; color: #7b837f; font-size: 12px; }
 .redaction-layer { position: absolute; inset: 0; z-index: 2; width: 100%; height: 100%; touch-action: none; }
 .redaction-layer.tool-redact { cursor: crosshair; }
 .redaction-layer.tool-select { cursor: default; }
+.redaction-layer.tool-crop { cursor: default; }
 .redaction-rect { fill: rgba(8, 12, 11, .87); stroke: transparent; vector-effect: non-scaling-stroke; cursor: pointer; }
+.tool-crop .redaction-rect { pointer-events: none; }
 .redaction-rect.is-selected { fill: rgba(8, 12, 11, .78); stroke: #2bb673; stroke-width: 2; stroke-dasharray: 5 3; }
 .redaction-draft { fill: rgba(8, 12, 11, .64); stroke: #2bb673; stroke-width: 1.5; stroke-dasharray: 5 3; vector-effect: non-scaling-stroke; pointer-events: none; }
+.crop-shade { fill: rgba(12, 18, 16, .48); pointer-events: none; }
+.crop-frame { fill: none; stroke: #20a568; stroke-width: 3; vector-effect: non-scaling-stroke; pointer-events: none; }
+.crop-handle { fill: #fff; stroke: #168957; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.crop-handle-n, .crop-handle-s { cursor: ns-resize; }
+.crop-handle-e, .crop-handle-w { cursor: ew-resize; }
+.crop-handle-nw, .crop-handle-se { cursor: nwse-resize; }
+.crop-handle-ne, .crop-handle-sw { cursor: nesw-resize; }
 
 .export-panel { min-width: 0; display: flex; flex-direction: column; gap: 20px; padding: 28px 22px 20px; border-left: 1px solid #d1d2cc; background: #f8f7f3; overflow: auto; }
 .panel-eyebrow { margin: 0 0 7px; color: var(--green); font-size: 10px; font-weight: 850; letter-spacing: .15em; }
@@ -131,7 +147,7 @@ button:disabled { cursor: not-allowed; opacity: .4; }
   .document-workspace { grid-row: 2; }
   .workspace-toolbar { padding: 0 10px; }
   .hint { max-width: 58%; }
-  .pages-scroll { padding: 28px 20px 170px 38px; }
+  .pages-scroll { padding: 28px 20px 170px 82px; }
   .export-panel { left: 12px; right: 12px; bottom: 12px; width: auto; max-height: 150px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; padding: 12px; }
   .export-panel > div:first-child, .export-summary, .local-note { display: none; }
   .quality-field { grid-column: 1; }

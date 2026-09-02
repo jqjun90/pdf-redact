@@ -3,7 +3,6 @@
 import type { ChangeEvent, DragEvent, PointerEvent as ReactPointerEvent } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { zipSync } from 'fflate';
 
 type Redaction = {
@@ -15,10 +14,23 @@ type Redaction = {
   height: number;
 };
 
+type CropRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type CropHandle = 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'nw';
 type Draft = Omit<Redaction, 'id' | 'pageIndex'>;
-type Tool = 'select' | 'redact';
+type Tool = 'select' | 'redact' | 'crop';
+type ExportMode = 'pages' | 'combined-crop';
 
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
+const DEFAULT_CROP: CropRect = { x: 0, y: 0, width: 1, height: 1 };
+const MIN_CROP_SIZE = 0.03;
+const MAX_STITCH_DIMENSION = 16000;
+const MAX_STITCH_AREA = 32_000_000;
 
 function cleanBaseName(name: string) {
   return name.replace(/\.pdf$/i, '').replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '') || 'redacted';
@@ -55,23 +67,36 @@ function PageCanvas({
   pageIndex,
   zoom,
   redactions,
+  crop,
+  included,
   selectedId,
   tool,
   onAdd,
   onSelect,
+  onCropChange,
+  onToggleIncluded,
 }: {
   document: PDFDocumentProxy;
   pageIndex: number;
   zoom: number;
   redactions: Redaction[];
+  crop: CropRect;
+  included: boolean;
   selectedId: string | null;
   tool: Tool;
   onAdd: (redaction: Redaction) => void;
   onSelect: (id: string | null) => void;
+  onCropChange: (crop: CropRect) => void;
+  onToggleIncluded: () => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<SVGSVGElement>(null);
   const startRef = useRef<{ x: number; y: number } | null>(null);
+  const cropDragRef = useRef<{
+    handle: CropHandle;
+    start: { x: number; y: number };
+    crop: CropRect;
+  } | null>(null);
   const [size, setSize] = useState({ width: 612, height: 792 });
   const [draft, setDraft] = useState<Draft | null>(null);
   const [rendering, setRendering] = useState(true);
@@ -111,8 +136,9 @@ function PageCanvas({
     };
   }, [document, pageIndex, zoom]);
 
-  function pointerPosition(event: ReactPointerEvent<SVGSVGElement>) {
-    const bounds = event.currentTarget.getBoundingClientRect();
+  function pointerPosition(event: { clientX: number; clientY: number }) {
+    const bounds = overlayRef.current?.getBoundingClientRect();
+    if (!bounds) return { x: 0, y: 0 };
     return {
       x: Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width)),
       y: Math.min(1, Math.max(0, (event.clientY - bounds.top) / bounds.height)),
@@ -132,6 +158,24 @@ function PageCanvas({
   }
 
   function continueDrawing(event: ReactPointerEvent<SVGSVGElement>) {
+    if (cropDragRef.current) {
+      const point = pointerPosition(event);
+      const { handle, start, crop: initial } = cropDragRef.current;
+      const dx = point.x - start.x;
+      const dy = point.y - start.y;
+      let left = initial.x;
+      let top = initial.y;
+      let right = initial.x + initial.width;
+      let bottom = initial.y + initial.height;
+
+      if (handle.includes('w')) left = Math.min(right - MIN_CROP_SIZE, Math.max(0, initial.x + dx));
+      if (handle.includes('e')) right = Math.max(left + MIN_CROP_SIZE, Math.min(1, initial.x + initial.width + dx));
+      if (handle.includes('n')) top = Math.min(bottom - MIN_CROP_SIZE, Math.max(0, initial.y + dy));
+      if (handle.includes('s')) bottom = Math.max(top + MIN_CROP_SIZE, Math.min(1, initial.y + initial.height + dy));
+
+      onCropChange({ x: left, y: top, width: right - left, height: bottom - top });
+      return;
+    }
     if (!startRef.current) return;
     const point = pointerPosition(event);
     const start = startRef.current;
@@ -144,6 +188,11 @@ function PageCanvas({
   }
 
   function finishDrawing(event: ReactPointerEvent<SVGSVGElement>) {
+    if (cropDragRef.current) {
+      cropDragRef.current = null;
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+      return;
+    }
     if (!startRef.current || !draft) return;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
     startRef.current = null;
@@ -153,9 +202,43 @@ function PageCanvas({
     }
   }
 
+  function startCropResize(handle: CropHandle, event: ReactPointerEvent<SVGCircleElement>) {
+    if (tool !== 'crop' || event.button !== 0 || !overlayRef.current) return;
+    event.stopPropagation();
+    overlayRef.current.setPointerCapture(event.pointerId);
+    cropDragRef.current = { handle, start: pointerPosition(event), crop };
+  }
+
+  const cropLeft = crop.x * size.width;
+  const cropTop = crop.y * size.height;
+  const cropRight = (crop.x + crop.width) * size.width;
+  const cropBottom = (crop.y + crop.height) * size.height;
+  const cropHandles: Array<{ handle: CropHandle; x: number; y: number }> = [
+    { handle: 'nw', x: cropLeft, y: cropTop },
+    { handle: 'n', x: (cropLeft + cropRight) / 2, y: cropTop },
+    { handle: 'ne', x: cropRight, y: cropTop },
+    { handle: 'e', x: cropRight, y: (cropTop + cropBottom) / 2 },
+    { handle: 'se', x: cropRight, y: cropBottom },
+    { handle: 's', x: (cropLeft + cropRight) / 2, y: cropBottom },
+    { handle: 'sw', x: cropLeft, y: cropBottom },
+    { handle: 'w', x: cropLeft, y: (cropTop + cropBottom) / 2 },
+  ];
+
   return (
-    <article className="page-card" aria-label={`Page ${pageIndex + 1}`}>
-      <div className="page-number">{pageIndex + 1}</div>
+    <article className={`page-card ${included ? '' : 'is-excluded'}`} aria-label={`Page ${pageIndex + 1}${included ? '' : ', excluded from export'}`}>
+      <div className="page-controls">
+        <div className="page-number">{pageIndex + 1}</div>
+        <button
+          className="page-inclusion-button"
+          type="button"
+          onClick={onToggleIncluded}
+          aria-pressed={!included}
+          title={`${included ? 'Exclude' : 'Include'} page ${pageIndex + 1} ${included ? 'from' : 'in'} export`}
+        >
+          <span aria-hidden="true">{included ? '−' : '+'}</span>
+          {included ? 'Exclude' : 'Include'}
+        </button>
+      </div>
       <div className={`page-surface ${rendering ? 'is-rendering' : ''}`} style={{ width: size.width, height: size.height }}>
         <canvas ref={canvasRef} />
         <svg
@@ -192,6 +275,32 @@ function PageCanvas({
               height={draft.height * size.height}
             />
           )}
+          {tool === 'crop' && (
+            <>
+              <path
+                className="crop-shade"
+                fillRule="evenodd"
+                d={`M 0 0 H ${size.width} V ${size.height} H 0 Z M ${cropLeft} ${cropTop} H ${cropRight} V ${cropBottom} H ${cropLeft} Z`}
+              />
+              <rect
+                className="crop-frame"
+                x={cropLeft}
+                y={cropTop}
+                width={crop.width * size.width}
+                height={crop.height * size.height}
+              />
+              {cropHandles.map(({ handle, x, y }) => (
+                <circle
+                  key={handle}
+                  className={`crop-handle crop-handle-${handle}`}
+                  cx={x}
+                  cy={y}
+                  r={7}
+                  onPointerDown={(event) => startCropResize(handle, event)}
+                />
+              ))}
+            </>
+          )}
         </svg>
         {rendering && <div className="page-loading">Rendering page…</div>}
       </div>
@@ -215,7 +324,11 @@ export default function Home() {
   const [exporting, setExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [exportDpi, setExportDpi] = useState(150);
+  const [exportMode, setExportMode] = useState<ExportMode>('combined-crop');
+  const [crops, setCrops] = useState<CropRect[]>([]);
+  const [includedPages, setIncludedPages] = useState<boolean[]>([]);
   const [notice, setNotice] = useState('');
+  const includedCount = includedPages.filter(Boolean).length;
 
   const commit = useCallback((next: Redaction[]) => {
     setRedactions((current) => {
@@ -277,6 +390,9 @@ export default function Home() {
         deleteSelected();
       } else if (!command && event.key.toLowerCase() === 'r') {
         setTool('redact');
+      } else if (!command && event.key.toLowerCase() === 'c') {
+        setTool('crop');
+        setExportMode('combined-crop');
       } else if (!command && (event.key.toLowerCase() === 'v' || event.key === 'Escape')) {
         setTool('select');
         setSelectedId(null);
@@ -303,7 +419,10 @@ export default function Home() {
     try {
       if (pdf) await pdf.cleanup();
       const pdfjs = await import('pdfjs-dist');
-      pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+      // Keep the worker outside Vite's module transform pipeline. In dev,
+      // transforming this file injects the HMR client, which expects `window`
+      // and crashes inside the worker before PDF.js falls back to the main thread.
+      pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
       const bytes = new Uint8Array(await nextFile.arrayBuffer());
       const loaded = await pdfjs.getDocument({ data: bytes }).promise;
       setFile(nextFile);
@@ -312,6 +431,10 @@ export default function Home() {
       setPast([]);
       setFuture([]);
       setSelectedId(null);
+      setCrops(Array.from({ length: loaded.numPages }, () => ({ ...DEFAULT_CROP })));
+      setIncludedPages(Array.from({ length: loaded.numPages }, () => true));
+      setTool('crop');
+      setExportMode('combined-crop');
     } catch (caught) {
       const message = caught instanceof Error && caught.name === 'PasswordException'
         ? 'Password-protected PDFs are not supported in this MVP.'
@@ -337,18 +460,24 @@ export default function Home() {
 
   async function exportJpgs() {
     if (!pdf || !file || exporting) return;
+    const includedPageNumbers = includedPages
+      .map((included, pageIndex) => included ? pageIndex + 1 : null)
+      .filter((pageNumber): pageNumber is number => pageNumber !== null);
+    if (!includedPageNumbers.length) {
+      setError('Include at least one page before exporting.');
+      return;
+    }
     setExporting(true);
     setExportProgress(0);
     setNotice('');
     setError('');
     try {
-      const output: Record<string, Uint8Array> = {};
       const base = cleanBaseName(file.name);
       const scale = exportDpi / 72;
 
-      for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-        const page = await pdf.getPage(pageNumber);
-        const viewport = page.getViewport({ scale });
+      async function renderPage(pageNumber: number, renderScale: number) {
+        const page = await pdf!.getPage(pageNumber);
+        const viewport = page.getViewport({ scale: renderScale });
         const canvas = document.createElement('canvas');
         canvas.width = Math.ceil(viewport.width);
         canvas.height = Math.ceil(viewport.height);
@@ -366,13 +495,81 @@ export default function Home() {
           const bottom = Math.min(canvas.height, Math.ceil((item.y + item.height) * canvas.height) + 2);
           context.fillRect(left, top, right - left, bottom - top);
         }
+        return canvas;
+      }
+
+      if (exportMode === 'combined-crop') {
+        async function measureCrops(renderScale: number) {
+          const dimensions: Array<{ width: number; height: number }> = [];
+          for (const pageNumber of includedPageNumbers) {
+            const page = await pdf!.getPage(pageNumber);
+            const viewport = page.getViewport({ scale: renderScale });
+            const canvasWidth = Math.ceil(viewport.width);
+            const canvasHeight = Math.ceil(viewport.height);
+            const crop = crops[pageNumber - 1] ?? DEFAULT_CROP;
+            const sourceX = Math.floor(crop.x * canvasWidth);
+            const sourceY = Math.floor(crop.y * canvasHeight);
+            dimensions.push({
+              width: Math.max(1, Math.min(canvasWidth - sourceX, Math.ceil(crop.width * canvasWidth))),
+              height: Math.max(1, Math.min(canvasHeight - sourceY, Math.ceil(crop.height * canvasHeight))),
+            });
+          }
+          return dimensions;
+        }
+
+        const dimensions = await measureCrops(scale);
+        const nominalWidth = Math.max(...dimensions.map((item) => item.width));
+        const nominalHeight = dimensions.reduce((total, item) => total + item.height, 0);
+        const fitScale = Math.min(
+          1,
+          MAX_STITCH_DIMENSION / nominalWidth,
+          MAX_STITCH_DIMENSION / nominalHeight,
+          Math.sqrt(MAX_STITCH_AREA / (nominalWidth * nominalHeight)),
+        );
+        const renderScale = scale * (fitScale < 1 ? fitScale * 0.98 : 1);
+        const fittedDimensions = fitScale < 1 ? await measureCrops(renderScale) : dimensions;
+        const stitched = document.createElement('canvas');
+        stitched.width = Math.max(...fittedDimensions.map((item) => item.width));
+        stitched.height = fittedDimensions.reduce((total, item) => total + item.height, 0);
+        const stitchedContext = stitched.getContext('2d', { alpha: false });
+        if (!stitchedContext) throw new Error('Canvas is unavailable.');
+        stitchedContext.fillStyle = '#ffffff';
+        stitchedContext.fillRect(0, 0, stitched.width, stitched.height);
+
+        let destinationY = 0;
+        for (const [exportIndex, pageNumber] of includedPageNumbers.entries()) {
+          const canvas = await renderPage(pageNumber, renderScale);
+          const crop = crops[pageNumber - 1] ?? DEFAULT_CROP;
+          const sourceX = Math.floor(crop.x * canvas.width);
+          const sourceY = Math.floor(crop.y * canvas.height);
+          const sourceWidth = Math.max(1, Math.min(canvas.width - sourceX, Math.ceil(crop.width * canvas.width)));
+          const sourceHeight = Math.max(1, Math.min(canvas.height - sourceY, Math.ceil(crop.height * canvas.height)));
+          const destinationX = Math.floor((stitched.width - sourceWidth) / 2);
+          stitchedContext.drawImage(canvas, sourceX, sourceY, sourceWidth, sourceHeight, destinationX, destinationY, sourceWidth, sourceHeight);
+          destinationY += sourceHeight;
+          canvas.width = 1;
+          canvas.height = 1;
+          setExportProgress((exportIndex + 1) / includedPageNumbers.length);
+        }
+
+        const blob = await canvasToBlob(stitched, 0.92);
+        downloadBlob(blob, `${base}-cropped-combined.jpg`);
+        stitched.width = 1;
+        stitched.height = 1;
+        setNotice(`Combined cropped JPG downloaded${fitScale < 1 ? ' at a browser-safe size' : ''}.`);
+        return;
+      }
+
+      const output: Record<string, Uint8Array> = {};
+      for (const [exportIndex, pageNumber] of includedPageNumbers.entries()) {
+        const canvas = await renderPage(pageNumber, scale);
 
         const blob = await canvasToBlob(canvas, 0.92);
         const bytes = new Uint8Array(await blob.arrayBuffer());
         output[pageFileName(base, pageNumber, pdf.numPages)] = bytes;
         canvas.width = 1;
         canvas.height = 1;
-        setExportProgress(pageNumber / pdf.numPages);
+        setExportProgress((exportIndex + 1) / includedPageNumbers.length);
       }
 
       const names = Object.keys(output);
@@ -401,6 +598,8 @@ export default function Home() {
     setRedactions([]);
     setPast([]);
     setFuture([]);
+    setCrops([]);
+    setIncludedPages([]);
     setSelectedId(null);
     setNotice('');
     setError('');
@@ -416,7 +615,7 @@ export default function Home() {
         <section className="hero">
           <p className="eyebrow">PRIVATE PDF REDACTION</p>
           <h1>Cover what matters.<br />Share only what should be seen.</h1>
-          <p className="lede">Redact sensitive information directly in your browser, then export clean JPG images. Nothing is uploaded.</p>
+          <p className="lede">Redact sensitive information or crop every page directly in your browser, then export clean JPG images. Nothing is uploaded.</p>
           <div
             className={`dropzone ${dragging ? 'is-dragging' : ''}`}
             onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
@@ -433,7 +632,7 @@ export default function Home() {
           {error && <p className="message error-message" role="alert">{error}</p>}
         </section>
         <footer className="home-footer">
-          <span><b>1</b> Add a PDF</span><i aria-hidden="true" /><span><b>2</b> Draw redactions</span><i aria-hidden="true" /><span><b>3</b> Export JPGs</span>
+          <span><b>1</b> Add a PDF</span><i aria-hidden="true" /><span><b>2</b> Redact or crop</span><i aria-hidden="true" /><span><b>3</b> Export JPGs</span>
         </footer>
       </main>
     );
@@ -443,7 +642,7 @@ export default function Home() {
     <main className="editor-shell">
       <header className="editor-topbar">
         <button className="brand brand-button" type="button" onClick={closeDocument} aria-label="Close PDF and return home"><span className="brand-mark" aria-hidden="true">B</span><span>Blackline</span></button>
-        <div className="document-title"><b>{file?.name}</b><span>{pdf.numPages} {pdf.numPages === 1 ? 'page' : 'pages'} · {redactions.length} {redactions.length === 1 ? 'redaction' : 'redactions'}</span></div>
+        <div className="document-title"><b>{file?.name}</b><span>{includedCount} of {pdf.numPages} {pdf.numPages === 1 ? 'page' : 'pages'} included · {redactions.length} {redactions.length === 1 ? 'redaction' : 'redactions'}</span></div>
         <button className="text-button" type="button" onClick={() => inputRef.current?.click()}>Replace PDF</button>
         <input ref={inputRef} type="file" accept="application/pdf,.pdf" onChange={onInput} hidden />
       </header>
@@ -452,6 +651,7 @@ export default function Home() {
         <aside className="left-toolbar" aria-label="Editor tools">
           <button className={tool === 'select' ? 'active' : ''} type="button" onClick={() => setTool('select')} aria-pressed={tool === 'select'} title="Select (V)"><Icon>↖</Icon><span>Select</span></button>
           <button className={tool === 'redact' ? 'active' : ''} type="button" onClick={() => setTool('redact')} aria-pressed={tool === 'redact'} title="Redact (R)"><Icon>▰</Icon><span>Redact</span></button>
+          <button className={tool === 'crop' ? 'active' : ''} type="button" onClick={() => { setTool('crop'); setExportMode('combined-crop'); }} aria-pressed={tool === 'crop'} title="Crop (C)"><Icon>⌗</Icon><span>Crop</span></button>
           <hr />
           <button type="button" onClick={undo} disabled={!past.length} title="Undo"><Icon>↶</Icon><span>Undo</span></button>
           <button type="button" onClick={redo} disabled={!future.length} title="Redo"><Icon>↷</Icon><span>Redo</span></button>
@@ -460,7 +660,7 @@ export default function Home() {
 
         <section className="document-workspace" aria-label="PDF pages">
           <div className="workspace-toolbar">
-            <div className="hint"><span className="hint-icon">i</span>{tool === 'redact' ? 'Drag over anything you want to remove' : 'Select a redaction to delete it'}</div>
+            <div className="hint"><span className="hint-icon">i</span>{tool === 'crop' ? 'Resize each green border to keep only what you need' : tool === 'redact' ? 'Drag over anything you want to remove' : 'Select a redaction to delete it'}</div>
             <div className="zoom-control" aria-label="Zoom controls">
               <button type="button" onClick={() => setZoom((value) => Math.max(.55, +(value - .15).toFixed(2)))} aria-label="Zoom out">−</button>
               <span>{Math.round(zoom * 100)}%</span>
@@ -475,10 +675,18 @@ export default function Home() {
                 pageIndex={pageIndex}
                 zoom={zoom}
                 redactions={redactions.filter((item) => item.pageIndex === pageIndex)}
+                crop={crops[pageIndex] ?? DEFAULT_CROP}
+                included={includedPages[pageIndex] ?? true}
                 selectedId={selectedId}
                 tool={tool}
                 onAdd={addRedaction}
                 onSelect={setSelectedId}
+                onCropChange={(nextCrop) => setCrops((current) => current.map((item, index) => index === pageIndex ? nextCrop : item))}
+                onToggleIncluded={() => {
+                  setIncludedPages((current) => current.map((included, index) => index === pageIndex ? !included : included));
+                  setNotice('');
+                  setError('');
+                }}
               />
             ))}
           </div>
@@ -488,7 +696,18 @@ export default function Home() {
           <div>
             <p className="panel-eyebrow">EXPORT</p>
             <h2>Make it permanent</h2>
-            <p>Redactions are burned into fresh JPG pixels. The PDF text and metadata are not included.</p>
+            <p>{exportMode === 'combined-crop' ? 'Each retained page region is joined vertically into one fresh JPG.' : 'Redactions are burned into fresh JPG pixels. The PDF text and metadata are not included.'}</p>
+          </div>
+          <div className="quality-field">
+            <label htmlFor="output-mode">Output format</label>
+            <select id="output-mode" value={exportMode} onChange={(event) => {
+              const nextMode = event.target.value as ExportMode;
+              setExportMode(nextMode);
+              setTool(nextMode === 'combined-crop' ? 'crop' : 'redact');
+            }} disabled={exporting}>
+              <option value="combined-crop">One combined cropped JPG</option>
+              <option value="pages">Separate full-page JPGs</option>
+            </select>
           </div>
           <div className="quality-field">
             <label htmlFor="quality">Image quality</label>
@@ -500,10 +719,10 @@ export default function Home() {
           </div>
           <div className="export-summary">
             <span>Output</span>
-            <b>{pdf.numPages === 1 ? '1 JPG image' : `${pdf.numPages} JPGs in a ZIP`}</b>
+            <b>{includedCount === 0 ? 'No pages selected' : exportMode === 'combined-crop' ? `1 combined JPG · ${includedCount} ${includedCount === 1 ? 'page' : 'pages'}` : includedCount === 1 ? '1 JPG image' : `${includedCount} JPGs in a ZIP`}</b>
           </div>
-          <button className="export-button" type="button" onClick={() => void exportJpgs()} disabled={exporting}>
-            {exporting ? `Exporting ${Math.round(exportProgress * 100)}%` : 'Apply & export JPGs'}
+          <button className="export-button" type="button" onClick={() => void exportJpgs()} disabled={exporting || includedCount === 0}>
+            {exporting ? `Exporting ${Math.round(exportProgress * 100)}%` : exportMode === 'combined-crop' ? 'Crop & export one JPG' : 'Apply & export JPGs'}
           </button>
           {exporting && <div className="progress-track" role="progressbar" aria-valuenow={Math.round(exportProgress * 100)}><span style={{ width: `${exportProgress * 100}%` }} /></div>}
           {notice && <p className="message success-message" role="status">{notice}</p>}
